@@ -23,7 +23,7 @@ from telegram.ext import (
 )
 
 # =========================
-# БАЗОВАЯ НАСТРОЙКА
+# BASE SETUP
 # =========================
 
 load_dotenv()
@@ -32,7 +32,7 @@ logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("max-assistant-bot")
+logger = logging.getLogger("max-assistant-bot-v2")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -40,56 +40,58 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Moscow")
 
 if not BOT_TOKEN:
-    raise RuntimeError("В .env не задан TELEGRAM_BOT_TOKEN")
+    raise RuntimeError("В .env или Environment Variables не задан TELEGRAM_BOT_TOKEN")
 
 TZ = ZoneInfo(TIMEZONE_NAME)
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "state.json"
 
-# OpenAI Responses API — текущий основной интерфейс генерации ответов в документации OpenAI. :contentReference[oaicite:1]{index=1}
 OPENAI_CLIENT: Optional[OpenAI] = None
 if OPENAI_API_KEY:
     OPENAI_CLIENT = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # =========================
-# ДАННЫЕ ПОЛЬЗОВАТЕЛЯ
+# USER STATE
 # =========================
 
 @dataclass
 class UserConfig:
-    # Общие настройки
+    # Profile / style
     user_name: str = "Макс"
+    mode: str = "medium"  # soft | medium | hard
+    tone: str = "человеческий, уверенный, средне настойчивый"
     wake_time: str = "09:00"
     end_time: str = "24:00"
-    tone: str = "человеческий, уверенный, средне настойчивый"
-    frequency: str = "часто"
+
+    # Priorities / business context
     main_priority: str = "деньги"
     priorities: List[str] = None
-
-    # Контекст
-    active_project: str = "М.Видео"
     current_projects: List[str] = None
+    active_project: str = "М.Видео"
     weak_points: List[str] = None
 
-    # День / задачи
+    # Day state
     morning_main_task: str = ""
     secondary_tasks: List[str] = None
     last_done: str = ""
     current_blocker: str = ""
+    blocker_type: str = ""  # fear | clarity | energy | avoidance | unknown
     last_status: str = ""
-    last_assistant_message: str = ""
+    money_goal_today: str = ""
+    money_result_today: str = ""
 
-    # Память
+    # Memory
     repeating_problem: str = ""
     recent_events: List[str] = None
     daily_journal: List[str] = None
 
-    # Поведение
+    # Tracking
     unanswered_pings: int = 0
     last_user_message_at: str = ""
     last_bot_message_at: str = ""
+    last_assistant_message: str = ""
 
     def __post_init__(self):
         if self.priorities is None:
@@ -100,7 +102,7 @@ class UserConfig:
             self.weak_points = [
                 "откладывает сложные шаги",
                 "может зависать, если неясен следующий шаг",
-                "уходит в прокрастинацию"
+                "уходит в прокрастинацию",
             ]
         if self.secondary_tasks is None:
             self.secondary_tasks = []
@@ -111,7 +113,7 @@ class UserConfig:
 
 
 # =========================
-# ХРАНЕНИЕ СОСТОЯНИЯ
+# STORAGE
 # =========================
 
 def _default_state() -> Dict[str, Any]:
@@ -150,7 +152,7 @@ def save_user_config(chat_id: int, cfg: UserConfig) -> None:
 
 
 # =========================
-# ВСПОМОГАТЕЛЬНАЯ ЛОГИКА
+# HELPERS
 # =========================
 
 def now_dt() -> datetime:
@@ -165,7 +167,7 @@ def stamp() -> str:
     return now_dt().strftime("%d.%m %H:%M")
 
 
-def add_recent_event(cfg: UserConfig, text: str, limit: int = 20) -> None:
+def add_recent_event(cfg: UserConfig, text: str, limit: int = 25) -> None:
     text = text.strip()
     if not text:
         return
@@ -173,7 +175,7 @@ def add_recent_event(cfg: UserConfig, text: str, limit: int = 20) -> None:
     cfg.recent_events = cfg.recent_events[-limit:]
 
 
-def add_journal_entry(cfg: UserConfig, text: str, limit: int = 40) -> None:
+def add_journal_entry(cfg: UserConfig, text: str, limit: int = 60) -> None:
     text = text.strip()
     if not text:
         return
@@ -188,25 +190,58 @@ def get_recent_context(cfg: UserConfig, limit: int = 10) -> str:
 
 
 def get_secondary_tasks_text(cfg: UserConfig) -> str:
-    if not cfg.secondary_tasks:
-        return "не указаны"
-    return ", ".join(cfg.secondary_tasks)
+    return ", ".join(cfg.secondary_tasks) if cfg.secondary_tasks else "не указаны"
+
+
+def mode_description(mode: str) -> str:
+    mapping = {
+        "soft": "мягкий, поддерживающий, но всё равно приводящий к действию",
+        "medium": "ровный, деловой, уверенный, средне настойчивый",
+        "hard": "жёсткий, прямой, без лишней поддержки, с акцентом на конкретный результат",
+    }
+    return mapping.get(mode, mapping["medium"])
+
+
+def classify_blocker(text: str) -> str:
+    t = text.lower()
+
+    if any(x in t for x in ["боюсь", "страшно", "опасаюсь", "стремно"]):
+        return "fear"
+    if any(x in t for x in ["не понимаю", "непонятно", "неясно", "как", "требования"]):
+        return "clarity"
+    if any(x in t for x in ["устал", "нет сил", "выгорел", "энергии нет", "сонный"]):
+        return "energy"
+    if any(x in t for x in ["откладываю", "потом", "не хочу", "сливаюсь", "прокраст", "залип"]):
+        return "avoidance"
+    return "unknown"
+
+
+def blocker_type_text(blocker_type: str) -> str:
+    mapping = {
+        "fear": "страх ошибки или неприятного исхода",
+        "clarity": "неясный следующий шаг",
+        "energy": "просадка по энергии",
+        "avoidance": "избегание и прокрастинация",
+        "unknown": "тип блокера не определён",
+        "": "не указан",
+    }
+    return mapping.get(blocker_type, "не указан")
 
 
 def detect_repeating_problem(cfg: UserConfig) -> None:
-    joined = " | ".join(cfg.recent_events[-10:]).lower()
+    joined = " | ".join(cfg.recent_events[-12:]).lower()
 
     if "упаков" in joined:
-        cfg.repeating_problem = "Ты несколько раз упирался в упаковку"
-    elif "мвидео" in joined and ("не сделал" in joined or "не начал" in joined or "отлож" in joined):
-        cfg.repeating_problem = "Ты откладываешь важные действия по М.Видео"
-    elif "wb" in joined and ("не сделал" in joined or "отлож" in joined):
-        cfg.repeating_problem = "Ты откладываешь действия по WB"
-    elif "прокраст" in joined or "залип" in joined or "телефон" in joined:
+        cfg.repeating_problem = "Ты уже несколько раз упирался в упаковку"
+    elif "мвидео" in joined and any(x in joined for x in ["не сделал", "не начал", "отлож", "потом"]):
+        cfg.repeating_problem = "Ты тянешь важные действия по М.Видео"
+    elif "wb" in joined and any(x in joined for x in ["не сделал", "не начал", "отлож", "потом"]):
+        cfg.repeating_problem = "Ты тянешь важные действия по WB"
+    elif any(x in joined for x in ["прокраст", "залип", "телефон", "отвлек", "слив"]):
         cfg.repeating_problem = "Ты снова провалился в прокрастинацию"
-    elif "не могу" in joined or "непонятно" in joined or "не понимаю" in joined:
+    elif any(x in joined for x in ["не понимаю", "непонятно", "неясно", "как сделать"]):
         cfg.repeating_problem = "Ты тормозишь на неясном следующем шаге"
-    elif "не сделал" in joined or "не начал" in joined or "отлож" in joined:
+    elif any(x in joined for x in ["не сделал", "не начал", "отлож", "потом"]):
         cfg.repeating_problem = "Ты повторно откладываешь важное действие"
     else:
         cfg.repeating_problem = ""
@@ -219,6 +254,7 @@ def format_status(cfg: UserConfig) -> str:
 
     return (
         f"Имя: {cfg.user_name}\n"
+        f"Режим: {cfg.mode}\n"
         f"Приоритет: {cfg.main_priority}\n"
         f"Зоны: {', '.join(cfg.priorities)}\n"
         f"Активный проект: {cfg.active_project}\n"
@@ -228,14 +264,29 @@ def format_status(cfg: UserConfig) -> str:
         f"Второстепенные:\n{secondary}\n\n"
         f"Сделано: {cfg.last_done or '—'}\n"
         f"Блокер: {cfg.current_blocker or '—'}\n"
+        f"Тип блокера: {blocker_type_text(cfg.blocker_type)}\n"
+        f"Денежная цель дня: {cfg.money_goal_today or '—'}\n"
+        f"Денежный результат дня: {cfg.money_result_today or '—'}\n"
         f"Последний статус: {cfg.last_status or '—'}\n"
         f"Повторяющаяся проблема: {cfg.repeating_problem or '—'}\n"
         f"Неотвеченных пингов: {cfg.unanswered_pings}"
     )
 
 
+def reset_day_fields(cfg: UserConfig) -> None:
+    cfg.morning_main_task = ""
+    cfg.secondary_tasks = []
+    cfg.last_done = ""
+    cfg.current_blocker = ""
+    cfg.blocker_type = ""
+    cfg.last_status = ""
+    cfg.money_goal_today = ""
+    cfg.money_result_today = ""
+    cfg.unanswered_pings = 0
+
+
 # =========================
-# OPENAI / FALLBACK
+# PROMPT / AI
 # =========================
 
 def build_prompt(cfg: UserConfig, event_type: str) -> str:
@@ -245,21 +296,25 @@ def build_prompt(cfg: UserConfig, event_type: str) -> str:
     return f"""
 Ты — персональный AI-ассистент Макса.
 
-Контекст о пользователе:
-- Макс — предприниматель
+Кто такой Макс:
+- предприниматель
 - главный приоритет сейчас: деньги
 - важные зоны: {", ".join(cfg.priorities)}
 - текущие проекты: {projects}
 - активный проект прямо сейчас: {cfg.active_project}
 - слабые места: {weak_points}
-- бот должен не просто поддерживать, а возвращать к действиям, которые двигают деньги
-- стиль общения: {cfg.tone}
+
+Текущий режим общения: {cfg.mode}
+Описание режима: {mode_description(cfg.mode)}
 
 Текущее состояние:
 - главная задача на день: {cfg.morning_main_task or "не зафиксирована"}
 - второстепенные задачи: {get_secondary_tasks_text(cfg)}
 - последнее выполненное действие: {cfg.last_done or "нет"}
 - текущий блокер: {cfg.current_blocker or "не указан"}
+- тип блокера: {blocker_type_text(cfg.blocker_type)}
+- денежная цель дня: {cfg.money_goal_today or "не указана"}
+- денежный результат дня: {cfg.money_result_today or "не указан"}
 - последний статус пользователя: {cfg.last_status or "нет"}
 - повторяющаяся проблема: {cfg.repeating_problem or "не выявлена"}
 - неотвеченных пингов подряд: {cfg.unanswered_pings}
@@ -272,15 +327,16 @@ def build_prompt(cfg: UserConfig, event_type: str) -> str:
 
 Правила:
 - отвечай по-русски
-- 2–5 коротких строк
+- 2–6 коротких строк
 - без воды
 - без эмодзи
-- без длинных вступлений
-- будь конкретным
-- если видно повторяющуюся проблему, назови её прямо
-- если человек застрял, помоги разбить на маленький следующий шаг
-- если он игнорирует, стань чуть жёстче, но не груби
-- в конце всегда вопрос или конкретное действие
+- не уходи в общие советы
+- опирайся на конкретный контекст
+- если это блокер ясности, разбивай на маленький следующий шаг
+- если это страх, снижай масштаб задачи
+- если это избегание, называй это прямо
+- если режим hard, будь более жёстким и требуй конкретику
+- всегда заканчивай конкретным вопросом или действием
 """.strip()
 
 
@@ -288,16 +344,13 @@ def call_openai(cfg: UserConfig, event_type: str) -> Optional[str]:
     if OPENAI_CLIENT is None:
         return None
 
-    prompt = build_prompt(cfg, event_type)
     try:
         response = OPENAI_CLIENT.responses.create(
             model=OPENAI_MODEL,
-            input=prompt,
+            input=build_prompt(cfg, event_type),
         )
         text = getattr(response, "output_text", None)
-        if text:
-            return text.strip()
-        return None
+        return text.strip() if text else None
     except Exception:
         logger.exception("Ошибка вызова OpenAI")
         return None
@@ -307,7 +360,38 @@ def fallback_message(cfg: UserConfig, event_type: str) -> str:
     main_task = cfg.morning_main_task or "главная задача ещё не зафиксирована"
     blocker = cfg.current_blocker or "блокер пока не назван"
 
-    messages = {
+    if event_type == "blocker_followup":
+        if cfg.blocker_type == "clarity":
+            return (
+                f"У тебя не тупик, а неясный шаг: {blocker}\n"
+                "Не решай всё сразу.\n"
+                "Выпиши 3 самых непонятных пункта и пришли их сюда."
+            )
+        if cfg.blocker_type == "fear":
+            return (
+                f"Похоже, тебя тормозит страх: {blocker}\n"
+                "Уменьши масштаб до безопасного шага.\n"
+                "Какое действие можно сделать без риска за 10 минут?"
+            )
+        if cfg.blocker_type == "avoidance":
+            return (
+                f"Это больше похоже на избегание: {blocker}\n"
+                "Хватит крутить задачу в голове.\n"
+                "Какой один конкретный шаг сделаешь сейчас?"
+            )
+        if cfg.blocker_type == "energy":
+            return (
+                f"Похоже, просела энергия: {blocker}\n"
+                "Не ломай себя об большую задачу.\n"
+                "Какой короткий шаг всё равно можно закрыть сейчас?"
+            )
+        return (
+            f"Похоже, тебя держит блокер: {blocker}\n"
+            "Разбиваем на маленький шаг.\n"
+            "Какое действие можно сделать за 10 минут прямо сейчас?"
+        )
+
+    mapping = {
         "morning": (
             "Доброе утро.\n"
             "Что сегодня реально двинет деньги?\n"
@@ -316,33 +400,28 @@ def fallback_message(cfg: UserConfig, event_type: str) -> str:
         ),
         "midday_check": (
             f"Ты уже начал главное действие?\n"
-            f"Сейчас у тебя фокус: {main_task}\n"
-            "Если нет — что мешает?"
+            f"Текущий фокус: {main_task}\n"
+            "Если нет — что именно мешает?"
         ),
         "money_refocus": (
             "Проверь фокус.\n"
-            "То, что ты делаешь сейчас, приближает деньги или это обходной манёвр?\n"
-            "Напиши честно одним сообщением."
+            "То, что ты делаешь сейчас, двигает деньги или это обходной манёвр?\n"
+            "Ответь коротко."
         ),
         "pressure_check": (
             "Стоп.\n"
-            "Ты опять двигаешься по главному или растёкся по мелочам?\n"
+            "Ты продвигаешь главное или снова растёкся по мелочам?\n"
             "Назови один следующий денежный шаг."
         ),
         "evening_result": (
             "Подведём итог.\n"
-            "Что сделал из денежного?\n"
+            "Что реально продвинул по деньгам?\n"
             "Что отложил и почему?"
         ),
         "night_truth": (
             "Скажи честно.\n"
-            "Сегодня ты усилил свою позицию или остался на месте?\n"
+            "Сегодня ты усилил позицию или остался на месте?\n"
             "Что первое делаешь завтра утром?"
-        ),
-        "blocker_followup": (
-            f"Похоже, ты упёрся сюда: {blocker}\n"
-            "Разбей это на шаг на 10 минут.\n"
-            "Какое первое действие сделаешь прямо сейчас?"
         ),
         "reply_to_user": (
             "Принял.\n"
@@ -354,14 +433,8 @@ def fallback_message(cfg: UserConfig, event_type: str) -> str:
             f"Главное сейчас: {main_task}\n"
             "Что мешает начать в ближайшие 10 минут?"
         ),
-        "summary": (
-            "Коротко.\n"
-            f"Главная задача: {main_task}\n"
-            f"Блокер: {blocker}\n"
-            "Что доводишь до результата сегодня?"
-        ),
     }
-    return messages.get(event_type, "Что сейчас самое важное действие для денег?")
+    return mapping.get(event_type, "Что сейчас самое важное действие для денег?")
 
 
 async def generate_message(cfg: UserConfig, event_type: str) -> str:
@@ -370,7 +443,7 @@ async def generate_message(cfg: UserConfig, event_type: str) -> str:
 
 
 # =========================
-# ПЛАНИРОВЩИК
+# SCHEDULE
 # =========================
 
 def remove_jobs_for_chat(application: Application, chat_id: int) -> None:
@@ -382,13 +455,10 @@ def remove_jobs_for_chat(application: Application, chat_id: int) -> None:
 def schedule_daily_jobs(application: Application, chat_id: int) -> None:
     jq = application.job_queue
     if jq is None:
-        raise RuntimeError(
-            "JobQueue недоступен. Убедись, что установлен python-telegram-bot[job-queue]."
-        )
+        raise RuntimeError("JobQueue недоступен. Убедись, что установлен python-telegram-bot[job-queue].")
 
     remove_jobs_for_chat(application, chat_id)
 
-    # run_daily — стандартный способ ежедневных задач через JobQueue. :contentReference[oaicite:2]{index=2}
     daily_events = [
         ("morning", time(9, 0, tzinfo=TZ)),
         ("midday_check", time(11, 30, tzinfo=TZ)),
@@ -416,10 +486,9 @@ async def send_scheduled_message(context: CallbackContext) -> None:
         return
 
     cfg = get_user_config(chat_id)
-
     event_type = str(job.data)
-    text = await generate_message(cfg, event_type)
 
+    text = await generate_message(cfg, event_type)
     cfg.last_assistant_message = text
     cfg.last_bot_message_at = now_str()
     cfg.unanswered_pings += 1
@@ -431,7 +500,7 @@ async def send_scheduled_message(context: CallbackContext) -> None:
 
 
 # =========================
-# КОМАНДЫ
+# COMMANDS
 # =========================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -454,8 +523,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/done что сделал\n"
         "/blocker что мешает\n"
         "/project название проекта\n"
+        "/mode soft|medium|hard\n"
         "/summary\n"
         "/journal\n"
+        "/resetday\n"
         "/status\n"
         "/help\n\n"
         "Я сам буду писать тебе в течение дня."
@@ -470,10 +541,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/done что сделал\n"
         "/blocker что мешает\n"
         "/project название проекта\n"
+        "/mode soft|medium|hard\n"
         "/summary — короткий разбор\n"
         "/journal — журнал последних событий\n"
+        "/resetday — сбросить дневной фокус без потери общей памяти\n"
         "/status — текущий статус\n"
-        "/reping — если хочешь, чтобы бот сам себя дожал сейчас\n\n"
+        "/reping — жёсткий дожим прямо сейчас\n\n"
         "Можно просто писать текстом — я отвечу с учётом контекста."
     )
 
@@ -487,10 +560,7 @@ async def focus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     raw = " ".join(context.args).strip()
     if not raw:
-        await update.message.reply_text(
-            "Напиши так:\n"
-            "/focus главная задача | второстепенная 1 | второстепенная 2"
-        )
+        await update.message.reply_text("Напиши так:\n/focus главная задача | второстепенная 1 | второстепенная 2")
         return
 
     parts = [x.strip() for x in raw.split("|") if x.strip()]
@@ -507,12 +577,12 @@ async def focus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if cfg.secondary_tasks:
         text = (
-            f"Принял.\n"
+            f"Зафиксировал.\n"
             f"Главное: {cfg.morning_main_task}\n"
-            f"Второстепенные:\n" + "\n".join([f"• {x}" for x in cfg.secondary_tasks])
+            "Второстепенные:\n" + "\n".join([f"• {x}" for x in cfg.secondary_tasks])
         )
     else:
-        text = f"Принял.\nГлавное: {cfg.morning_main_task}"
+        text = f"Зафиксировал.\nГлавное: {cfg.morning_main_task}"
 
     await update.message.reply_text(text)
 
@@ -526,13 +596,12 @@ async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     raw = " ".join(context.args).strip()
     if not raw:
-        await update.message.reply_text(
-            "Напиши, что именно сделал.\nПример:\n/done оформил поставку в М.Видео"
-        )
+        await update.message.reply_text("Напиши, что именно сделал.\nПример:\n/done оформил поставку в М.Видео")
         return
 
     cfg.last_done = raw
     cfg.current_blocker = ""
+    cfg.blocker_type = ""
     cfg.last_status = "Есть выполненное действие"
     cfg.unanswered_pings = 0
     cfg.last_user_message_at = now_str()
@@ -560,6 +629,7 @@ async def blocker_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     cfg.current_blocker = raw
+    cfg.blocker_type = classify_blocker(raw)
     cfg.last_status = "Есть блокер"
     cfg.unanswered_pings = 0
     cfg.last_user_message_at = now_str()
@@ -602,6 +672,31 @@ async def project_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(f"Ок. Теперь главный проект: {raw}")
 
 
+async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.effective_chat is not None
+    assert update.message is not None
+
+    chat_id = update.effective_chat.id
+    cfg = get_user_config(chat_id)
+
+    raw = " ".join(context.args).strip().lower()
+    if not raw:
+        await update.message.reply_text(f"Текущий режим: {cfg.mode}\nИспользуй: /mode soft|medium|hard")
+        return
+
+    if raw not in {"soft", "medium", "hard"}:
+        await update.message.reply_text("Нужен один из режимов: soft, medium, hard")
+        return
+
+    cfg.mode = raw
+    cfg.last_status = f"Режим переключён на {raw}"
+    add_recent_event(cfg, f"Режим общения переключён на: {raw}")
+    add_journal_entry(cfg, f"Смена режима: {raw}")
+    save_user_config(chat_id, cfg)
+
+    await update.message.reply_text(f"Ок. Теперь режим: {raw}")
+
+
 async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert update.effective_chat is not None
     assert update.message is not None
@@ -611,7 +706,7 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     custom_prompt = f"""
 Ты — личный AI-ассистент Макса.
-Сделай короткий разбор состояния на основе данных ниже.
+Сделай короткий разбор текущего состояния.
 
 {format_status(cfg)}
 
@@ -626,6 +721,7 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 Правила:
 - по-русски
 - максимум 8 строк
+- конкретно
 - без воды
 """.strip()
 
@@ -644,9 +740,9 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if not text:
         text = (
-            "1. Что хорошо: у тебя уже есть активный проект и зафиксированный контекст.\n"
-            "2. Где риск: если главная задача не доведена, день снова расползётся.\n"
-            f"3. Следующий шаг: добей {cfg.morning_main_task or cfg.active_project} конкретным действием сегодня."
+            f"1. Что хорошо: у тебя уже зафиксирован контекст по проекту {cfg.active_project}.\n"
+            f"2. Где риск: если не добить {cfg.morning_main_task or 'главную задачу'}, день снова расползётся.\n"
+            "3. Следующий шаг: закрой один конкретный результат сегодня."
         )
 
     await update.message.reply_text(text)
@@ -663,6 +759,21 @@ async def journal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     text = "Журнал последних событий:\n\n" + "\n".join(cfg.daily_journal[-15:])
     await update.message.reply_text(text[:4000])
+
+
+async def resetday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.effective_chat is not None
+    assert update.message is not None
+
+    chat_id = update.effective_chat.id
+    cfg = get_user_config(chat_id)
+
+    reset_day_fields(cfg)
+    add_recent_event(cfg, "Выполнен resetday — дневной фокус очищен")
+    add_journal_entry(cfg, "Сброс дневного фокуса")
+    save_user_config(chat_id, cfg)
+
+    await update.message.reply_text("Ок. Дневной фокус очищен, общая память сохранена.")
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -690,7 +801,7 @@ async def reping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # =========================
-# ОБЫЧНЫЕ СООБЩЕНИЯ
+# REGULAR TEXT
 # =========================
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -702,18 +813,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     cfg = get_user_config(chat_id)
 
     lowered = user_text.lower()
-
     cfg.last_status = user_text[:250]
     cfg.last_user_message_at = now_str()
     cfg.unanswered_pings = 0
 
-    if any(x in lowered for x in ["сделал", "готово", "закончил", "выполнил", "добил"]):
+    if any(x in lowered for x in ["сделал", "готово", "закончил", "выполнил", "добил", "отправил", "закрыл"]):
         cfg.last_done = user_text
         cfg.current_blocker = ""
+        cfg.blocker_type = ""
         add_journal_entry(cfg, f"Пользователь сообщил о результате: {user_text[:200]}")
-    elif any(x in lowered for x in ["не могу", "мешает", "непонятно", "не понимаю", "застрял", "стопор"]):
+    elif any(x in lowered for x in ["не могу", "мешает", "непонятно", "не понимаю", "застрял", "стопор", "боюсь"]):
         cfg.current_blocker = user_text
+        cfg.blocker_type = classify_blocker(user_text)
         add_journal_entry(cfg, f"Пользователь сообщил о блокере: {user_text[:200]}")
+    elif any(x in lowered for x in ["деньги", "выручка", "доход", "продажи"]):
+        cfg.money_result_today = user_text[:200]
+        add_journal_entry(cfg, f"Пользователь сообщил денежный статус: {user_text[:200]}")
     else:
         add_journal_entry(cfg, f"Сообщение пользователя: {user_text[:200]}")
 
@@ -724,10 +839,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     event_type = "reply_to_user"
-    if cfg.repeating_problem and cfg.unanswered_pings >= 2:
-        event_type = "no_reply_followup"
-    elif cfg.current_blocker:
+    if cfg.current_blocker:
         event_type = "blocker_followup"
+    elif cfg.repeating_problem and cfg.mode == "hard":
+        event_type = "no_reply_followup"
 
     text = await generate_message(cfg, event_type)
     cfg.last_assistant_message = text
@@ -750,8 +865,10 @@ def main() -> None:
     app.add_handler(CommandHandler("done", done_cmd))
     app.add_handler(CommandHandler("blocker", blocker_cmd))
     app.add_handler(CommandHandler("project", project_cmd))
+    app.add_handler(CommandHandler("mode", mode_cmd))
     app.add_handler(CommandHandler("summary", summary_cmd))
     app.add_handler(CommandHandler("journal", journal_cmd))
+    app.add_handler(CommandHandler("resetday", resetday_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("reping", reping_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
